@@ -22,6 +22,8 @@ class ModelArgs:
 
     device: str = None
 
+
+
 def pos_freq_theta(h_dim: int, seq_len: int, device:str, factor:float = 10000):
     
     assert h_dim % 2 == 0, "Head dimension must be even!!"
@@ -41,6 +43,9 @@ def pos_freq_theta(h_dim: int, seq_len: int, device:str, factor:float = 10000):
 
     return freqs_theta
 
+
+
+
 def calc_rope(x: torch.Tensor, freqs_theta: torch.Tensor, device:str):
 
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # in the [x1 + ix2] form
@@ -55,6 +60,115 @@ def calc_rope(x: torch.Tensor, freqs_theta: torch.Tensor, device:str):
     return x_out.type_as(x).to(device)
 
 
+
+class RMSNorm(nn.Module):
+    
+    def __init__(self, dim: int, eps:float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x:torch.Tensor):
+        # (b,s,d) * (b,s,1) = (b,s,d)
+        # rsqrt = 1/sqrt
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+    def forward(self, x:torch.Tensor):
+        # (dim) * (b,s,d) = (b,s,d)
+        return self.weight * self._norm(x)  
+    
+
+def replicate_kv(x:torch.Tensor, n_rep:int):
+    b, s, kv_h, h_dim = x.shape
+    if n_rep == 1:
+        return x
+    else:
+        return (x[:, :, :, None, :].expand(b, s, kv_h, n_rep, h_dim).reshape(b, s, kv_h * n_rep, h_dim))
+
+class SelfAttention(nn.Module):
+
+    def __init__(self, args:ModelArgs) -> None:
+        super().__init__()
+        # TODO: parallelization removed here; check out in og LLaMA repo
+        self.kv_heads = args.kv_heads if args.kv_heads is not None else args.n_heads
+        self.q_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.n_rep = self.q_heads // self.kv_heads
+
+        self.w_q = nn.Linear(args.dim, self.head_dim * self.q_heads, bias=False)
+        self.w_k = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
+        self.w_v = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
+        self.w_o = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        self.k_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.kv_heads, self.head_dim))
+        self.v_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.kv_heads, self.head_dim))
+
+
+    def forward(self, x:torch.Tensor, start:int, freqs:torch.Tensor):
+        b, s, _ = x.shape
+
+        xq = self.w_q(x)
+        xk = self.w_k(x)
+        xv = self.w_v(x)
+        xq = xq.view(b, s, self.q_heads, self.head_dim)
+        xk = xk.view(b, s, self.kv_heads, self.head_dim)
+        xv = xv.view(b, s, self.kv_heads, self.head_dim)
+
+        # apply RoPE to Q and K only
+        xq = calc_rope(xq, freqs, x.device)
+        xk = calc_rope(xk, freqs, x.device)
+
+        # Replace entry in cache with current xk and xv
+        self.k_cache[:b, start:start+s] = xk
+        self.v_cache[:b, start:start+s] = xv
+
+        # Retrieve all cached keys and values till current position
+        keys = self.k_cache[:b, 0:start+s]
+        values = self.v_cache[:b, 0:start+s]
+
+        # replicate key and value heads to match q heads
+        keys = replicate_kv(keys, self.n_rep)
+        values = replicate_kv(values, self.n_rep)
+
+        # (b, 1, h_q, h_dim) -> (b, h_q, 1, h_dim)
+        xq = xq.transpose(1,2)
+        keys = keys.transpose(1,2)
+        values = values.transpose(1,2)
+
+        # (b,h_q,1,h_dim) @ (b, h_q, h_dim, seq_len_kv) -> (b, h_q, 1, seq_len_kv)
+        scores = torch.matmul(xq, keys.transose(2,3)) / math.sqrt(self.head_dim)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+
+        # (b, h_q, 1, seq_len_kv) @ (b, h_q, seq_len_kv, h_dim) -> (b, h_q, 1, h_dim)
+        out = torch.matmul(scores, values)
+
+        # (b, h_q, 1, h_dim) -> (b, 1, h_q, h_dim) -> (b, 1, dim)
+        out = (out.transpose(1,2).contiguous().view(b, s, -1))
+        return self.w_o(out)
+
+
+
+
+
+    
+
+class EncoderBlock(nn.Module):
+
+    def __init__(self, args:ModelArgs) -> None:
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention  = SelfAttention(args)
+        self.ffn = FFN(args)
+        self.norm1 = RMSNorm(self.dim, args.norm_eps)
+        self.norm2 = RMSNorm(self.dim, args.norm_eps)
+
+    def forward(self, x:torch.Tensor, start:int, freqs: torch.Tensor):
+        h = x + self.attention.forward(self.norm1(x), start, freqs)
+        out = h + self.ffn.forward(self.norm2(x))
+        return out    
 
 
 class Transformer(nn.Module):
