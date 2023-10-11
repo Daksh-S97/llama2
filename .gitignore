@@ -4,3 +4,4 @@ USE_POLICY.md
 params.json
 tokenizer.model
 tokenizer_checklist.chk
+__pycache__/

@@ -60,13 +60,42 @@ def calc_rope(x: torch.Tensor, freqs_theta: torch.Tensor, device:str):
     return x_out.type_as(x).to(device)
 
 
+def replicate_kv(x:torch.Tensor, n_rep:int):
+    b, s, kv_h, h_dim = x.shape
+    if n_rep == 1:
+        return x
+    else:
+        return (x[:, :, :, None, :].expand(b, s, kv_h, n_rep, h_dim).reshape(b, s, kv_h * n_rep, h_dim))
+
+
+class FeedForward(nn.Module):
+
+    def __init__(self, args:ModelArgs) -> None:
+        super().__init__()
+        self.hidden_dim = int(8 * args.dim / 3)
+
+        # Round to nearest multiple of args.multiple_of greater than hidden dim
+        self.hidden_dim = args.multiple_of * ((self.hidden_dim + args.multiple_of -1) // args.multiple_of)
+
+        # swiglu (x, V, W, w2) = (swish(xW) @ xV) w2
+        self.w1 = nn.Linear(args.dim, self.hidden_dim, bias=False)
+        self.w2 = nn.Linear(self.hidden_dim, args.dim, bias=False)
+        self.w3 = nn.Linear(args.dim, self.hidden_dim, bias=False)
+
+    def forward(self, x:torch.Tensor):
+        swish = F.silu(self.w1(x))
+        xV = self.w3(x)
+        x = swish * xV
+        return self.w2(x)    
+
+
 
 class RMSNorm(nn.Module):
     
     def __init__(self, dim: int, eps:float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x:torch.Tensor):
         # (b,s,d) * (b,s,1) = (b,s,d)
@@ -78,12 +107,6 @@ class RMSNorm(nn.Module):
         return self.weight * self._norm(x)  
     
 
-def replicate_kv(x:torch.Tensor, n_rep:int):
-    b, s, kv_h, h_dim = x.shape
-    if n_rep == 1:
-        return x
-    else:
-        return (x[:, :, :, None, :].expand(b, s, kv_h, n_rep, h_dim).reshape(b, s, kv_h * n_rep, h_dim))
 
 class SelfAttention(nn.Module):
 
@@ -96,10 +119,10 @@ class SelfAttention(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.n_rep = self.q_heads // self.kv_heads
 
-        self.w_q = nn.Linear(args.dim, self.head_dim * self.q_heads, bias=False)
-        self.w_k = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
-        self.w_v = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
-        self.w_o = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        self.wq = nn.Linear(args.dim, self.head_dim * self.q_heads, bias=False)
+        self.wk = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
+        self.wv = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
         self.k_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.kv_heads, self.head_dim))
         self.v_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.kv_heads, self.head_dim))
@@ -108,9 +131,9 @@ class SelfAttention(nn.Module):
     def forward(self, x:torch.Tensor, start:int, freqs:torch.Tensor):
         b, s, _ = x.shape
 
-        xq = self.w_q(x)
-        xk = self.w_k(x)
-        xv = self.w_v(x)
+        xq = self.wq(x)
+        xk = self.wk(x)
+        xv = self.wv(x)
         xq = xq.view(b, s, self.q_heads, self.head_dim)
         xk = xk.view(b, s, self.kv_heads, self.head_dim)
         xv = xv.view(b, s, self.kv_heads, self.head_dim)
@@ -131,7 +154,7 @@ class SelfAttention(nn.Module):
         keys = replicate_kv(keys, self.n_rep)
         values = replicate_kv(values, self.n_rep)
 
-        # (b, 1, h_q, h_dim) -> (b, h_q, 1, h_dim)
+        # (b, 1, h_q, h_dim) -> (b, h_q, 1, h_dim); each head needs to look at entire seq_len (which is 1 for q, and seq_len_kv for k and v)
         xq = xq.transpose(1,2)
         keys = keys.transpose(1,2)
         values = values.transpose(1,2)
@@ -145,11 +168,7 @@ class SelfAttention(nn.Module):
 
         # (b, h_q, 1, h_dim) -> (b, 1, h_q, h_dim) -> (b, 1, dim)
         out = (out.transpose(1,2).contiguous().view(b, s, -1))
-        return self.w_o(out)
-
-
-
-
+        return self.wo(out)
 
     
 
@@ -161,13 +180,13 @@ class EncoderBlock(nn.Module):
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
         self.attention  = SelfAttention(args)
-        self.ffn = FFN(args)
-        self.norm1 = RMSNorm(self.dim, args.norm_eps)
-        self.norm2 = RMSNorm(self.dim, args.norm_eps)
+        self.feed_forward = FeedForward(args)
+        self.attention_norm = RMSNorm(self.dim, args.norm_eps)
+        self.ffn_norm = RMSNorm(self.dim, args.norm_eps)
 
     def forward(self, x:torch.Tensor, start:int, freqs: torch.Tensor):
-        h = x + self.attention.forward(self.norm1(x), start, freqs)
-        out = h + self.ffn.forward(self.norm2(x))
+        h = x + self.attention.forward(self.attention_norm(x), start, freqs)
+        out = h + self.feed_forward.forward(self.ffn_norm(x))
         return out    
 
 
