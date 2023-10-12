@@ -104,7 +104,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x:torch.Tensor):
         # (dim) * (b,s,d) = (b,s,d)
-        return self.weight * self._norm(x)  
+        return self.weight * self._norm(x.float()).type_as(x)  
     
 
 
