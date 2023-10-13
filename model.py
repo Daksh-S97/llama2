@@ -52,7 +52,7 @@ def calc_rope(x: torch.Tensor, freqs_theta: torch.Tensor, device:str):
     
     freqs_theta = freqs_theta.unsqueeze(0).unsqueeze(2) # (s,h_dim/2) -> (1, s, 1, h_dim/2)
     
-    mat = x_complex @ freqs_theta # (b, s, h, h_dim/2) * (1, s, 1, h_dim/2) -> (b, s, h, h_dim/2)
+    mat = x_complex * freqs_theta # (b, s, h, h_dim/2) * (1, s, 1, h_dim/2) -> (b, s, h, h_dim/2)
 
     x_out = torch.view_as_real(mat) # (b, s, h, h_dim) -> (b, s, h, h_dim/2, 2); extra dimension as each element goes from a+ib to [a, b] 
     x_out = x_out.reshape(*x.shape)
@@ -160,7 +160,7 @@ class SelfAttention(nn.Module):
         values = values.transpose(1,2)
 
         # (b,h_q,1,h_dim) @ (b, h_q, h_dim, seq_len_kv) -> (b, h_q, 1, seq_len_kv)
-        scores = torch.matmul(xq, keys.transose(2,3)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(xq, keys.transpose(2,3)) / math.sqrt(self.head_dim)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
 
         # (b, h_q, 1, seq_len_kv) @ (b, h_q, seq_len_kv, h_dim) -> (b, h_q, 1, h_dim)
@@ -221,7 +221,7 @@ class Transformer(nn.Module):
         complex_freqs = self.complex_freq[start:start + seq_len]
 
         for layer in self.layers:
-            inp = layer(tokens, start, complex_freqs)
+            inp = layer(inp, start, complex_freqs)
 
         inp = self.norm(inp)
         out = self.output(inp).float() 

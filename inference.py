@@ -113,7 +113,7 @@ class LLaMA:
                 tokens[:, start_pos] = new_tokens
 
                 # EOS reached if EOS token found AND cur_pos is not a padding token
-                eos_reached |= (~inp_mask[:, start_pos]) and (new_tokens == self.tokenizer.eos_id())
+                eos_reached |= (~inp_mask[:, start_pos]) & (new_tokens == self.tokenizer.eos_id())
                 if all(eos_reached):
                     break
                 
@@ -154,5 +154,5 @@ if __name__ == '__main__':
     out_texts, out_tokens = model.text_completion(prompts, max_gen_len=128)
     assert len(out_texts) == len(prompts)
     for i in range(len(out_texts)):
-        print(out_texts[i])
+        print(f'{out_texts[i]}')
         print('*' * 50)
