@@ -10,7 +10,7 @@ class ModelArgs:
     dim: int = 4096
     n_layers: int = 32
     n_heads: int = 32     # for Q
-    kv_heads: Optional[int] = None   # for Grouped Multi-Query Attention
+    n_kv_heads: Optional[int] = None   # for Grouped Multi-Query Attention
     vocab_size: int = -1
     multiple_of: int = 256
     ffn_hidden_mult: Optional[float] = None
@@ -28,7 +28,7 @@ def pos_freq_theta(h_dim: int, seq_len: int, device:str, factor:float = 10000):
     
     assert h_dim % 2 == 0, "Head dimension must be even!!"
 
-    # build theta vector acc. to formula thetas = 10000 ^ -(2*i/dim) for i = [0,1,...h/2]
+    # build theta vector acc. to the formula thetas = 10000 ^ -(2*i/dim) for i = [0,1,...h/2]
     num = torch.arange(0, h_dim, 2)
     thetas = 1.0/ (factor ** (num/h_dim)).to(device)
 
@@ -113,19 +113,19 @@ class SelfAttention(nn.Module):
     def __init__(self, args:ModelArgs) -> None:
         super().__init__()
         # TODO: parallelization removed here; check out in og LLaMA repo
-        self.kv_heads = args.kv_heads if args.kv_heads is not None else args.n_heads
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.q_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
-        self.n_rep = self.q_heads // self.kv_heads
+        self.n_rep = self.q_heads // self.n_kv_heads
 
         self.wq = nn.Linear(args.dim, self.head_dim * self.q_heads, bias=False)
-        self.wk = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
-        self.wv = nn.Linear(args.dim, self.head_dim * self.kv_heads, bias=False)
+        self.wk = nn.Linear(args.dim, self.head_dim * self.n_kv_heads, bias=False)
+        self.wv = nn.Linear(args.dim, self.head_dim * self.n_kv_heads, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        self.k_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.kv_heads, self.head_dim))
-        self.v_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.kv_heads, self.head_dim))
+        self.k_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
+        self.v_cache = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
 
 
     def forward(self, x:torch.Tensor, start:int, freqs:torch.Tensor):
@@ -135,8 +135,8 @@ class SelfAttention(nn.Module):
         xk = self.wk(x)
         xv = self.wv(x)
         xq = xq.view(b, s, self.q_heads, self.head_dim)
-        xk = xk.view(b, s, self.kv_heads, self.head_dim)
-        xv = xv.view(b, s, self.kv_heads, self.head_dim)
+        xk = xk.view(b, s, self.n_kv_heads, self.head_dim)
+        xv = xv.view(b, s, self.n_kv_heads, self.head_dim)
 
         # apply RoPE to Q and K only
         xq = calc_rope(xq, freqs, x.device)
@@ -147,8 +147,8 @@ class SelfAttention(nn.Module):
         self.v_cache[:b, start:start+s] = xv
 
         # Retrieve all cached keys and values till current position
-        keys = self.k_cache[:b, 0:start+s]
-        values = self.v_cache[:b, 0:start+s]
+        keys = self.k_cache[:b, :start+s]
+        values = self.v_cache[:b, :start+s]
 
         # replicate key and value heads to match q heads
         keys = replicate_kv(keys, self.n_rep)
@@ -181,12 +181,12 @@ class EncoderBlock(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.attention  = SelfAttention(args)
         self.feed_forward = FeedForward(args)
-        self.attention_norm = RMSNorm(self.dim, args.norm_eps)
-        self.ffn_norm = RMSNorm(self.dim, args.norm_eps)
+        self.attention_norm = RMSNorm(self.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(self.dim, eps=args.norm_eps)
 
     def forward(self, x:torch.Tensor, start:int, freqs: torch.Tensor):
         h = x + self.attention.forward(self.attention_norm(x), start, freqs)
-        out = h + self.feed_forward.forward(self.ffn_norm(x))
+        out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out    
 
 

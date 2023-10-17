@@ -10,9 +10,6 @@ from model import ModelArgs, Transformer
 
 
 
-
-
-
 class LLaMA:
 
     def __init__(self, model:Transformer, tokenizer:SentencePieceProcessor, args:ModelArgs) -> None:
@@ -55,6 +52,7 @@ class LLaMA:
         if load_model:
             start = time.time()
             del checkpoint['rope.freqs']
+            print("Loading model...")
             model.load_state_dict(checkpoint, strict=True)
             print(f'Loaded model in {time.time() - start:.2f}s')
 
@@ -80,10 +78,10 @@ class LLaMA:
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
 
-        inp_tokens = [self.tokenizer.Encode(prompt, out_type=int, add_bos=True, add_eos=False) for prompt in prompts]
+        inp_tokens = [self.tokenizer.encode(prompt, out_type=int, add_bos=True, add_eos=False) for prompt in prompts]
         batch_size = len(prompts)
         assert batch_size <= self.args.max_batch_size, "Batch size too large"
-        max_inp_len = max(len(prompt) for prompt in prompts)
+        max_inp_len = max(len(prompt) for prompt in inp_tokens)
         assert max_inp_len <= self.args.max_seq_len, "Prompt too long"
         gen_length = min(self.args.max_seq_len, max_gen_len + max_inp_len)
 
@@ -98,35 +96,36 @@ class LLaMA:
         for start_pos in tqdm(range(1, gen_length), desc="Generating tokens...."):
             with torch.no_grad():
                 logits = self.model.forward(tokens[:, start_pos-1:start_pos], start_pos)
-                if temp > 0:
-                    # top_p strategy after scaling logits by temp
-                    probs = torch.softmax(logits[:, -1] / temp, dim = -1)
-                    new_tokens = self.get_top_p(probs, top_p)
-                else:
-                    # greedy
-                    new_tokens = torch.argmax(torch.softmax(logits[:, -1], dim=-1), dim=-1)
+            if temp > 0:
+                # top_p strategy after scaling logits by temp
+                probs = torch.softmax(logits[:, -1] / temp, dim = -1)
+                new_tokens = self.get_top_p(probs, top_p)
+            else:
+                # greedy
+                new_tokens = torch.argmax(logits[:, -1], dim=-1)
 
-                new_tokens = new_tokens.reshape(-1)
-                # replace in tokens if cur_pos is a padding token
-                # Mask true hai toh keep og token, false hai toh use new token
-                new_tokens = torch.where(inp_mask[:, start_pos], tokens[:, start_pos], new_tokens)
-                tokens[:, start_pos] = new_tokens
+            new_tokens = new_tokens.reshape(-1)
+            # replace in tokens if cur_pos is a padding token
+            # Mask true hai toh keep og token, false hai toh use new token
+            new_tokens = torch.where(inp_mask[:, start_pos], tokens[:, start_pos], new_tokens)
+            tokens[:, start_pos] = new_tokens
 
-                # EOS reached if EOS token found AND cur_pos is not a padding token
-                eos_reached |= (~inp_mask[:, start_pos]) & (new_tokens == self.tokenizer.eos_id())
-                if all(eos_reached):
-                    break
+            # EOS reached if EOS token found AND cur_pos is a padding token
+            # |= -> in place OR
+            eos_reached |= (~inp_mask[:, start_pos]) & (new_tokens == self.tokenizer.eos_id())
+            if all(eos_reached):
+                break
                 
         
         out_texts = []
         out_tokens = []
         for idx, prompt_tokens in enumerate(tokens.tolist()):
             # truncate output if EOS in prompt
-            if self.tokenizer.eos_id() in prompt_tokens:
-                eos_idx = prompt_tokens.index(self.tokenizer.eos_id())
+            if self.tokenizer.eos_id in prompt_tokens:
+                eos_idx = prompt_tokens.index(self.tokenizer.eos_id)
                 prompt_tokens = prompt_tokens[:eos_idx]
             out_tokens.append(prompt_tokens)
-            out_texts.append(self.tokenizer.Decode(prompt_tokens))
+            out_texts.append(self.tokenizer.decode(prompt_tokens))
 
         return (out_texts, out_tokens)        
 
@@ -139,20 +138,36 @@ if __name__ == '__main__':
     use_cuda = False
     device = "cuda" if torch.cuda.is_available() and use_cuda else "cpu"
 
-    prompts = ["Opeth's best album is", "Translate English to Swedish: Heart in Hand =>", "Tell me more about the Israel-Palestine conflict"]
-
+    prompts = ["Objectively, Opeth's best album is", "Translate English to Swedish: Heart in Hand =>", "Tell me more about the Israel-Palestine conflict"]
+    prompts = [
+        "Simply put, the theory of relativity states that ",
+        "If Google was an Italian company founded in Milan, it would",
+        # Few shot promt
+        """Translate English to French:
+        
+        sea otter => loutre de mer
+        peppermint => menthe poivrée
+        plush girafe => girafe peluche
+        cheese =>""",
+        # Zero shot prompt
+        """Tell me if the following person is actually Doraemon disguised as human:
+        Name: Daksh Sinha
+        Decision: 
+        """
+    ]
     model = LLaMA.build(
         chkpt_dir='llama-2-7b/',
         tok_pth='tokenizer.model',
         load_model=True,
         max_seq_len=1024,
-        max_batch_size=3,
+        max_batch_size=len(prompts),
         device=device
     )
 
     print("Loaded model")
-    out_texts, out_tokens = model.text_completion(prompts, max_gen_len=128)
+    out_texts, out_tokens = model.text_completion(prompts, max_gen_len=64)
     assert len(out_texts) == len(prompts)
+    
     for i in range(len(out_texts)):
         print(f'{out_texts[i]}')
-        print('*' * 50)
+        print('*' * 100)
